@@ -1,0 +1,31 @@
+openarm_teleop_vr_node:
+  ros__parameters:
+    # urdf_path is injected by the launch file by default.
+    urdf_path: ""
+
+    control_rate: 100.0        # Hz
+    grip_threshold: 0.5        # grip value above which an arm engages
+    gripper_max: 0.044         # metres (fully open); OpenArm parallel gripper
+
+    # Per-joint max change per control tick (deg) -> safety speed limit.
+    max_step_deg_per_joint: [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]
+
+    # Controller-delta scaling and controller-frame -> robot-base-frame rotation.
+    # Identity is the starting point; tune once the live VR stream is connected
+    # (see README "Tuning the mapping").
+    position_scale_xyz: [1.0, 1.0, 1.0]
+    axis_matrix: [1.0, 0.0, 0.0,
+                  0.0, 1.0, 0.0,
+                  0.0, 0.0, 1.0]
+
+    # Input topics (match openarm_teleop_bridge_vr defaults).
+    left_pose_topic: "/vr_left_controller/pose"
+    right_pose_topic: "/vr_right_controller/pose"
+    left_grip_topic: "/vr_left_controller/grip"
+    right_grip_topic: "/vr_right_controller/grip"
+    left_trigger_topic: "/vr_left_controller/trigger"
+    right_trigger_topic: "/vr_right_controller/trigger"
+
+    # Output command topics (consumed by the Isaac node or real ros2_control).
+    left_cmd_topic: "/left_forward_position_controller/commands"
+    right_cmd_topic: "/right_forward_position_controller/commands"

@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>openarm_teleop_vr</name>
+  <version>0.1.0</version>
+  <description>VR teleoperation for the OpenArm bimanual robot using an open Pinocchio IK core.</description>
+  <maintainer email="kevin.li@tnmathcoalition.org">OpenArm Teleop</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_msgs</depend>
+  <!-- Pinocchio is provided via pip ('pin') or ros-humble-pinocchio; not a rosdep key here. -->
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
