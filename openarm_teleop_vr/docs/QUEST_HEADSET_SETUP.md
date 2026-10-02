@@ -25,8 +25,15 @@ branch `6.0_basic`).
 
 ## This PC's facts (for substitution below)
 
-* PC IP: **`10.149.50.185`** (interface `enp0s31f6`). Re-check with `hostname -I`.
-* UDP **5100** is free. The Quest must be on a network that can reach this IP.
+* PC has two NICs — pick whichever network the Quest can actually join:
+  * **`192.168.0.214`** (interface `enp1s0`, Aquantia) — plain LAN behind
+    `192.168.0.1`. **Preferred**: no client isolation to worry about.
+  * `10.149.50.185` (interface `enp0s31f6`) — campus/corporate `10.149.x.x/16`
+    network; may have Wi-Fi client isolation that blocks UDP between devices.
+  * Re-check either with `hostname -I` / `ip -brief addr show`.
+* UDP **5100** is free. The Quest must join the **same subnet** as whichever IP
+  you use below (i.e. connect to the Wi-Fi/AP behind `192.168.0.1` for the
+  preferred option).
 
 ---
 
@@ -73,23 +80,23 @@ adb version
 
 ## Step 4 — Network + firewall
 
-* Put the Quest 3s on the **same subnet** as the PC (`10.149.x.x/16` here), or at
-  least a network that can route to `10.149.50.185`. A shared Wi-Fi AP is typical;
-  corporate/campus Wi-Fi with client isolation will block it — use a phone hotspot
-  or a small router if so.
+* Put the Quest 3s on the **same subnet** as the PC's `192.168.0.214` interface —
+  join whatever Wi-Fi/AP is behind `192.168.0.1`. (Falling back to the campus
+  `10.149.x.x/16` network works too, but is more likely to hit Wi-Fi client
+  isolation that silently drops the UDP packets.)
 * The PC must accept inbound UDP 5100. If `ufw` is active:
   ```bash
   sudo ufw allow 5100/udp     # only if a firewall is enabled
   ```
 * Sanity-check the PC is reachable from the Quest's network (from another device
-  on that network: `ping 10.149.50.185`).
+  on that network: `ping 192.168.0.214`).
 
 ## Step 5 — Launch the app and point it at the PC
 
 1. In the headset: **App Library → Unknown Sources →** launch the OpenArmX VR app.
 2. Press the **menu** button on a controller to open **“EDIT IP ADDRESS”**.
-3. Enter the PC IP **`10.149.50.185`** (port is fixed at 5100). Confirm — you
-   should see a “UDP connection established to 10.149.50.185:5100” style state.
+3. Enter the PC IP **`192.168.0.214`** (port is fixed at 5100). Confirm — you
+   should see a “UDP connection established to 192.168.0.214:5100” style state.
 
 ## Step 6 — Start the PC-side stack
 

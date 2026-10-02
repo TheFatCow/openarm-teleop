@@ -44,6 +44,71 @@ def quat_xyzw_to_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
     return pin.Quaternion(q[3], q[0], q[1], q[2]).matrix()
 
 
+def _matrix_to_quat_wxyz(R: np.ndarray) -> np.ndarray:
+    q = pin.Quaternion(R)
+    q.normalize()
+    return np.array([q.w, q.x, q.y, q.z], dtype=np.float64)
+
+
+def _quat_wxyz_to_matrix(q: np.ndarray) -> np.ndarray:
+    return pin.Quaternion(q[0], q[1], q[2], q[3]).matrix()
+
+
+def _quat_slerp(q0: np.ndarray, q1: np.ndarray, t: float) -> np.ndarray:
+    """Shortest-path SLERP between two (w,x,y,z) quaternions."""
+    q0 = q0 / np.linalg.norm(q0)
+    q1 = q1 / np.linalg.norm(q1)
+    dot = float(np.dot(q0, q1))
+    if dot < 0.0:            # take the shorter arc
+        q1 = -q1
+        dot = -dot
+    if dot > 0.9995:         # nearly identical -> linear + renormalize
+        q = q0 + t * (q1 - q0)
+        return q / np.linalg.norm(q)
+    theta = np.arccos(np.clip(dot, -1.0, 1.0))
+    s0 = np.sin((1.0 - t) * theta) / np.sin(theta)
+    s1 = np.sin(t * theta) / np.sin(theta)
+    return s0 * q0 + s1 * q1
+
+
+class _LPFilter:
+    """First-order low-pass on a vector. Mirrors PAPRLE's LPFilter."""
+
+    def __init__(self, alpha: float):
+        self.alpha = float(alpha)
+        self.y = None
+
+    def next(self, x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float64)
+        if self.y is None:
+            self.y = x.copy()
+        else:
+            self.y = self.y + self.alpha * (x - self.y)
+        return self.y.copy()
+
+    def reset(self):
+        self.y = None
+
+
+class _LPRotationFilter:
+    """SLERP low-pass on a rotation. Mirrors PAPRLE's LPRotationFilter."""
+
+    def __init__(self, alpha: float):
+        self.alpha = float(alpha)
+        self.q = None  # (w,x,y,z)
+
+    def next(self, R: np.ndarray) -> np.ndarray:
+        q = _matrix_to_quat_wxyz(R)
+        if self.q is None:
+            self.q = q
+        else:
+            self.q = _quat_slerp(self.q, q, self.alpha)
+        return _quat_wxyz_to_matrix(self.q)
+
+    def reset(self):
+        self.q = None
+
+
 @dataclass
 class ControllerInput:
     """One controller's instantaneous state."""
@@ -73,12 +138,16 @@ class TeleopResult:
 
 @dataclass
 class IKConfig:
-    max_iters: int = 100
-    eps: float = 1e-4          # convergence threshold on the 6D log error norm
+    max_iters: int = 50
+    eps: float = 1e-3          # convergence threshold on the 6D log error norm
     damp: float = 1e-6         # damped-least-squares lambda^2
     dt: float = 1.0            # integration step on the velocity update
     v_max: float = 2.0         # clamp on the joint-velocity update norm (rad)
-    restarts: int = 4          # random restarts if the seed fails to converge
+    # Random restarts MUST stay 0 for teleop: a restart can return a completely
+    # different arm configuration than the seed, so consecutive ticks jump
+    # between solution branches and the arm visibly contorts. Best-effort from
+    # the current configuration is always the right answer while tracking.
+    restarts: int = 0
 
 
 class _Arm:
@@ -156,16 +225,34 @@ class _Arm:
 
 
 class _ArmTeleopState:
-    def __init__(self):
+    def __init__(self, pos_alpha: float, rot_alpha: float):
         self.engaged = False
-        self.ctrl_anchor: Optional[pin.SE3] = None
-        self.ee_anchor: Optional[pin.SE3] = None
+        self.ee_target: Optional[pin.SE3] = None   # accumulated EE goal (base frame)
+        self.past_p: Optional[np.ndarray] = None    # previous controller position (mapped)
+        self.past_R: Optional[np.ndarray] = None    # previous controller rotation (mapped)
         self.last_q = np.zeros(7, dtype=np.float64)
         self.gripper = 0.0
+        self.pos_filter = _LPFilter(pos_alpha)
+        self.rot_filter = _LPRotationFilter(rot_alpha)
+
+    def reset_filters(self):
+        self.pos_filter.reset()
+        self.rot_filter.reset()
 
 
 class OpenArmTeleopCore:
-    """Bimanual relative teleop: controller poses -> 14 joint targets + grippers."""
+    """Bimanual relative teleop: controller poses -> 14 joint targets + grippers.
+
+    Delta handling follows PAPRLE's ``oculus.py``: instead of a single world-frame
+    anchor delta, each tick's controller motion is measured **relative to the
+    previous frame, in the controller's own (body) frame**, and composed onto the
+    EE goal in its local frame (``ee_target = ee_target * delta``). Translation and
+    rotation are low-pass / SLERP filtered to kill controller jitter, and the
+    "previous controller pose" keeps updating even while disengaged so releasing
+    and re-gripping never jumps (clutching). Body-frame deltas track the way the
+    hand moves *relative to how it is held*, which is far more intuitive than
+    world-frame deltas when the operator's wrist orientation drifts.
+    """
 
     def __init__(
         self,
@@ -176,6 +263,8 @@ class OpenArmTeleopCore:
         axis_matrix: Optional[np.ndarray] = None,
         gripper_max: float = 0.044,
         ik_cfg: Optional[IKConfig] = None,
+        pos_filter_alpha: float = 0.5,
+        rot_filter_alpha: float = 0.5,
     ):
         full = pin.buildModelFromUrdf(urdf_path)
         ik_cfg = ik_cfg or IKConfig()
@@ -184,48 +273,62 @@ class OpenArmTeleopCore:
 
         self.grip_threshold = float(grip_threshold)
         self.position_scale = np.asarray(position_scale_xyz, dtype=np.float64)
+        # axis_matrix maps the controller frame -> robot base frame (change of basis)
         self.axis_matrix = (np.eye(3) if axis_matrix is None
                             else np.asarray(axis_matrix, dtype=np.float64).reshape(3, 3))
         self.gripper_max = float(gripper_max)
 
-        self._state = {"left": _ArmTeleopState(), "right": _ArmTeleopState()}
+        self._state = {
+            "left": _ArmTeleopState(pos_filter_alpha, rot_filter_alpha),
+            "right": _ArmTeleopState(pos_filter_alpha, rot_filter_alpha),
+        }
 
     # -- per-arm relative-teleop update ------------------------------------
-    def _controller_se3(self, ctrl: ControllerInput) -> pin.SE3:
-        R = quat_xyzw_to_matrix(*ctrl.quat_xyzw)
-        return pin.SE3(R, np.asarray(ctrl.position, dtype=np.float64).reshape(3))
-
-    def _target_ee(self, ctrl_now: pin.SE3, st: _ArmTeleopState) -> pin.SE3:
-        """Map the controller delta (since engage) onto the anchored EE pose."""
+    def _mapped_controller(self, ctrl: ControllerInput) -> tuple[np.ndarray, np.ndarray]:
+        """Controller pose expressed in the robot base frame (filtered)."""
         A = self.axis_matrix
-        # translation delta in controller/world frame -> robot base frame
-        dp_world = ctrl_now.translation - st.ctrl_anchor.translation
-        dp = A @ (self.position_scale * dp_world)
-        # rotation delta, conjugated into the robot base frame
-        dR_world = ctrl_now.rotation @ st.ctrl_anchor.rotation.T
-        dR = A @ dR_world @ A.T
-        target_R = dR @ st.ee_anchor.rotation
-        target_p = st.ee_anchor.translation + dp
-        return pin.SE3(target_R, target_p)
+        R = A @ quat_xyzw_to_matrix(*ctrl.quat_xyzw) @ A.T
+        p = A @ np.asarray(ctrl.position, dtype=np.float64).reshape(3)
+        return p, R
 
     def _step_arm(self, arm: _Arm, st: _ArmTeleopState, ctrl: ControllerInput,
                   q_current: np.ndarray) -> tuple[np.ndarray, float, bool]:
         st.last_q = np.array(q_current, dtype=np.float64).copy()
         engaged_now = ctrl.valid and ctrl.grip > self.grip_threshold
 
+        # Always update the (filtered) current controller pose in base frame, even
+        # while disengaged -- this is the clutch: re-gripping continues from here.
+        if ctrl.valid:
+            p_raw, R_raw = self._mapped_controller(ctrl)
+            p_c = st.pos_filter.next(p_raw)
+            R_c = st.rot_filter.next(R_raw)
+        else:
+            p_c, R_c = st.past_p, st.past_R
+
         if not engaged_now:
             st.engaged = False
+            st.past_p, st.past_R = p_c, R_c
+            # hold the last commanded goal (or current pose if never engaged)
             return q_current.copy(), st.gripper, False
 
-        ctrl_se3 = self._controller_se3(ctrl)
-        if not st.engaged:
-            # rising edge -> anchor controller pose and current EE pose
+        if not st.engaged or st.ee_target is None or st.past_p is None:
+            # rising edge -> anchor the EE goal at the current pose; no motion yet
             st.engaged = True
-            st.ctrl_anchor = ctrl_se3
-            st.ee_anchor = arm.fk(q_current)
+            st.ee_target = arm.fk(q_current)
+            st.past_p, st.past_R = p_c, R_c
+            st.gripper = float(np.clip(ctrl.trigger, 0.0, 1.0)) * self.gripper_max
+            return q_current.copy(), st.gripper, True
 
-        target = self._target_ee(ctrl_se3, st)
-        q_target, _ = arm.ik(target, q_current)
+        # body-frame incremental motion since last frame (PAPRLE oculus.py):
+        #   new_pos = past_R^T (p_now - p_past)   (translation delta in controller frame)
+        #   new_rot = past_R^T R_now              (rotation delta in controller frame)
+        new_pos = st.past_R.T @ (self.position_scale * (p_c - st.past_p))
+        new_rot = st.past_R.T @ R_c
+        delta = pin.SE3(new_rot, new_pos)
+        st.ee_target = st.ee_target * delta      # compose in the EE's local frame
+
+        q_target, _ = arm.ik(st.ee_target, q_current)
+        st.past_p, st.past_R = p_c, R_c
         st.gripper = float(np.clip(ctrl.trigger, 0.0, 1.0)) * self.gripper_max
         return q_target, st.gripper, True
 
@@ -248,5 +351,7 @@ class OpenArmTeleopCore:
     def reset(self):
         for st in self._state.values():
             st.engaged = False
-            st.ctrl_anchor = None
-            st.ee_anchor = None
+            st.ee_target = None
+            st.past_p = None
+            st.past_R = None
+            st.reset_filters()
